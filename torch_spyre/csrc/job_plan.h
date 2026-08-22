@@ -190,6 +190,11 @@ struct LaunchContext {
    *
    */
   const std::vector<at::Tensor>& inputs_outputs;
+
+  // Set by JobPlanStepHostCompute when this launch's tensor addresses match the
+  // previous launch, so the correction blob already on device is still correct.
+  // The paired H2D consumes and clears the flag to skip its DMA.
+  bool correction_resident = false;
 };
 
 /**
@@ -463,6 +468,12 @@ class JobPlanStepHostCompute final : public JobPlanStep {
 
   // Pre-compiled patch plan for fast execution
   mutable deeptools::FastHcmPatchPlan fast_plan_;
+
+  // Tensor DMVAs the correction blob in output_buffer_ was last patched for.
+  // fastProcessHcm() is a pure function of these, so an identical vector means
+  // both the host buffer and its device copy are already correct.
+  mutable std::vector<int64_t> resident_addresses_;
+  mutable bool resident_valid_ = false;
 };
 
 /**

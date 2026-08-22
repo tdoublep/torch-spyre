@@ -16,6 +16,12 @@
 
 #include "job_plan.h"
 
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -29,8 +35,63 @@
 
 namespace spyre {
 
-void JobPlanStepH2D::construct(LaunchContext&,
+namespace {
+
+// Reusing the resident correction blob is on by default; set
+// TORCH_SPYRE_RESIDENT_CORRECTION=0 to force a re-patch and re-DMA per launch.
+bool residentCorrectionEnabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("TORCH_SPYRE_RESIDENT_CORRECTION");
+    return env == nullptr || std::string(env) != "0";
+  }();
+  return enabled;
+}
+
+// Hit/miss accounting. Set TORCH_SPYRE_RESIDENT_CORRECTION_STATS to a path
+// prefix; "<prefix>.<pid>" is rewritten every kStatsInterval launches. A file
+// (rather than a stream at exit) survives vLLM worker subprocesses, which do
+// not reliably run static destructors.
+std::atomic<uint64_t> g_correction_hits{0};
+std::atomic<uint64_t> g_correction_misses{0};
+std::atomic<uint64_t> g_correction_bytes_saved{0};
+constexpr uint64_t kStatsInterval = 2000;
+
+const char* statsPathPrefix() {
+  static const char* prefix =
+      std::getenv("TORCH_SPYRE_RESIDENT_CORRECTION_STATS");
+  return prefix;
+}
+
+void maybeWriteStats() {
+  const char* prefix = statsPathPrefix();
+  if (prefix == nullptr) return;
+  uint64_t hits = g_correction_hits.load(std::memory_order_relaxed);
+  uint64_t misses = g_correction_misses.load(std::memory_order_relaxed);
+  uint64_t total = hits + misses;
+  if (total % kStatsInterval != 0) return;
+  std::ofstream out(std::string(prefix) + "." + std::to_string(getpid()));
+  if (!out) return;
+  out << "launches=" << total << " hits=" << hits << " misses=" << misses
+      << " hit_rate="
+      << (total ? (100.0 * static_cast<double>(hits) /
+                   static_cast<double>(total))
+                : 0.0)
+      << " h2d_bytes_skipped="
+      << g_correction_bytes_saved.load(std::memory_order_relaxed) << "\n";
+}
+
+}  // namespace
+
+void JobPlanStepH2D::construct(LaunchContext& ctx,
                                const SpyreStream& stream) const {
+  // The preceding HostCompute step sets this when the correction blob already
+  // on device is still valid for this launch, making this DMA redundant.
+  if (ctx.correction_resident) {
+    ctx.correction_resident = false;
+    g_correction_bytes_saved.fetch_add(device_address_.total_size(),
+                                      std::memory_order_relaxed);
+    return;
+  }
   auto* params =
       flex::createDmaParams(host_address_, device_address_.total_size(),
                             /*to_device=*/true, &device_address_);
@@ -187,6 +248,22 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
         (static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
              ->composite_addr));
     addresses[addr_idx++] = addr;
+  }
+
+  // fastProcessHcm() patches output_buffer_ as a pure function of these
+  // addresses, so an unchanged vector means the blob already sitting in the
+  // program allocation is still correct: skip both the patch and the H2D.
+  if (residentCorrectionEnabled()) {
+    if (resident_valid_ && addresses == resident_addresses_) {
+      ctx.correction_resident = true;
+      g_correction_hits.fetch_add(1, std::memory_order_relaxed);
+      maybeWriteStats();
+      return;
+    }
+    resident_addresses_ = addresses;
+    resident_valid_ = true;
+    g_correction_misses.fetch_add(1, std::memory_order_relaxed);
+    maybeWriteStats();
   }
 
   launch_host_callback([this, addresses](void*) {
