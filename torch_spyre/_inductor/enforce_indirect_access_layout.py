@@ -41,6 +41,7 @@ from torch._inductor.ir import (
 from torch_spyre._C import SpyreTensorLayout
 
 from .constants import ELIDED_COPY_BACK_ATTR
+from .errors import Unsupported
 from .insert_restickify import (
     _create_restickify_node,
     _fixed_tiled,
@@ -577,8 +578,19 @@ def _enforce_scatter_destination_layout(
         return
 
     # Compute write coordinates against the target's layout and find positions
-    # of IndirectAccess markers.
-    write_coords = device_coordinates(target_stl, write_dep, None)
+    # of IndirectAccess markers. The sizes must be the scatter's real
+    # indirect_sizes: device_coordinates drops indirect symbols outright when
+    # passed None, so the marker search below could never match.
+    subs_from_op, scatter_sizes = _scatter_access_subs_and_sizes(
+        scatter_op, _output_real_layout(scatter_op), write_dep
+    )
+    if subs_from_op:
+        scatter_access_subs = subs_from_op
+    try:
+        write_coords = device_coordinates(target_stl, write_dep, scatter_sizes)
+    except Unsupported:
+        # A size we could not resolve; fall back to the conservative copy.
+        write_coords = []
     indirect_stride_idxs = []
     for idx, coord in enumerate(reversed(write_coords)):
         substituted = coord.xreplace(scatter_access_subs)
