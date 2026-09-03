@@ -3063,7 +3063,9 @@ def _per_core_view_from_prep(
         #       higher-rank host tensor while dep is indexed via a lower-rank
         #       reshape view; the work-split factor spans multiple device
         #       dims but reaches us as a single (h, factor) (e.g.
-        #       test_matmul_tiled_y, test_qkv_attn_paths_fms_*_gqa).
+        #       test_matmul_tiled_y, test_qkv_attn_paths_fms_*_gqa). The case
+        #       where a core's chunk covers one whole slot of an outer device
+        #       dim is rescued below; the rest still falls through.
         #   (B) Multi-stick stride with partial coverage —
         #       h = k * stride_map[num_stick_dim], k > 1, but
         #       split * k < num_stick (rescue above only
@@ -3073,6 +3075,37 @@ def _per_core_view_from_prep(
         # HBM via the caller's mismatch logic. Future work: extend the
         # PerCoreView schema to express multi-dim or strided splits, or
         # refuse the buffer earlier in scratchpad planning.
+        # (A) Collapsed-axis rescue: a lower-rank reshape view can spread one
+        # host axis over several device dims (a gather output
+        # [entries, rows, k] read as [entries*rows, k]). The split's element
+        # stride h then resolves to the innermost contributor, whose extent is
+        # only the per-core chunk. The per-core chunk stride identifies the
+        # outer contributor instead; accept it only when the inner contributor
+        # tiles exactly one slot of that dim and the dim's extent is exactly
+        # the split factor, so a core owns one whole slot and ownership stays a
+        # single contiguous (axis, slice) that PerCoreView can express.
+        if dev_dim is None or device_size[dev_dim] % split != 0:
+            iter_extent_expr = iter_space[sym]
+            if isinstance(iter_extent_expr, tuple):
+                iter_extent_expr = iter_extent_expr[0]
+            iter_extent = concretize_expr(iter_extent_expr)
+            chunk_stride = h * (iter_extent // split) if split else 0
+            inner_tiles_slot = dev_dim is None or (
+                device_size[dev_dim] * stride_map[dev_dim] == chunk_stride
+            )
+            if iter_extent % split == 0 and inner_tiles_slot:
+                chunk_dim = device_stride_to_dim.get(chunk_stride)
+                if (
+                    chunk_dim is not None
+                    and chunk_dim not in work_slice_dims
+                    and device_size[chunk_dim] == split
+                ):
+                    logger.debug(
+                        f"collapsed-axis rescue: split {sym} factor={split} "
+                        f"h={h} placed on device dim {chunk_dim}"
+                    )
+                    dev_dim = chunk_dim
+
         if (
             dev_dim is None
             or dev_dim in work_slice_dims
